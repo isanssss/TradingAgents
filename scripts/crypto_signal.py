@@ -12,6 +12,7 @@ quick technical screen, e.g.::
     python scripts/crypto_signal.py WLD --signal-tf 15m --trend-tf 1h
     python scripts/crypto_signal.py WLD --preset scalp   # 5m entry / 15m trend
     python scripts/crypto_signal.py WLD --heatmap        # + order-book liquidity heatmap
+    python scripts/crypto_signal.py WLD --entry fade     # limit entry at the wall, stop beyond it
 
 Data is pulled from public, key-less exchange endpoints (OKX, with Kraken as a
 fallback). This is a research/technical tool, not financial advice.
@@ -389,6 +390,8 @@ def build_signal(
     sl_atr_mult: float = 1.5,
     tp_mults: tuple[float, float] = (1.5, 3.0),
     lookback: int = 20,
+    entry_style: str = "momentum",
+    heatmap: Optional[Heatmap] = None,
 ) -> Signal:
     i = len(sig_candles) - 1
     price = sig_candles[i].close
@@ -460,6 +463,49 @@ def build_signal(
 
     # ----- 3. Trigger, invalidation, entry, stop, targets ----------------- #
     buf = 0.3 * a  # small buffer beyond structure
+
+    # Fade / mean-reversion: enter AT the opposing liquidity wall with the stop
+    # placed BEYOND that wall, so a stop-hunt wick into the wall does not eject
+    # the position. Requires a heatmap with the relevant wall.
+    fade_wall = None
+    if entry_style == "fade" and heatmap is not None:
+        fade_wall = heatmap.resistance if side == "SHORT" else heatmap.support
+    if entry_style == "fade" and fade_wall is not None:
+        wall = fade_wall
+        # stop sits beyond the far edge of the wall, padded by ~1 ATR
+        wall_pad = max(a, buf)
+        if side == "SHORT":
+            sig.entry = wall.mid
+            sig.trigger = f"Limit SHORT into resistance wall ~{fmt(wall.mid)} (fade)"
+            sig.trigger_price = wall.mid
+            sig.stop_loss = wall.high + wall_pad
+            sig.invalidation = wall.high
+            sig.invalidation_note = (
+                f"acceptance/close ABOVE resistance wall {fmt(wall.high)} cancels the short"
+            )
+            risk = sig.stop_loss - sig.entry
+            if risk > 0:
+                sig.take_profit = [sig.entry - tp_mults[0] * risk, sig.entry - tp_mults[1] * risk]
+                sig.risk_reward = tp_mults[0]
+        else:
+            sig.entry = wall.mid
+            sig.trigger = f"Limit LONG into support wall ~{fmt(wall.mid)} (fade)"
+            sig.trigger_price = wall.mid
+            sig.stop_loss = wall.low - wall_pad
+            sig.invalidation = wall.low
+            sig.invalidation_note = (
+                f"acceptance/close BELOW support wall {fmt(wall.low)} cancels the long"
+            )
+            risk = sig.entry - sig.stop_loss
+            if risk > 0:
+                sig.take_profit = [sig.entry + tp_mults[0] * risk, sig.entry + tp_mults[1] * risk]
+                sig.risk_reward = tp_mults[0]
+        sig.status = "PENDING"  # resting limit order at the wall
+        sig.bias_reason += " | fade entry at order-book wall"
+        strength = abs(trend.score) + len(reasons)
+        sig.confidence = "high" if strength >= 6 else "medium" if strength >= 4 else "low"
+        return sig
+
     if side == "LONG":
         if status == "ACTIVE":
             sig.entry = price
@@ -776,6 +822,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--ema-fast", type=int, default=None, help="Override fast EMA period")
     parser.add_argument("--ema-slow", type=int, default=None, help="Override slow EMA period")
     parser.add_argument(
+        "--entry",
+        choices=["momentum", "fade"],
+        default="momentum",
+        help=(
+            "Entry style: 'momentum' = breakout/breakdown beyond the swing "
+            "(default); 'fade' = limit entry AT the order-book wall with the "
+            "stop placed BEYOND it (needs heatmap, auto-enabled)."
+        ),
+    )
+    parser.add_argument(
         "--heatmap",
         action="store_true",
         help="Add an order-book liquidity heatmap (support/resistance walls)",
@@ -816,13 +872,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     trend_ind = compute_indicators(trend_candles, ema_fast, ema_slow)
     sig_ind = compute_indicators(sig_candles, ema_fast, ema_slow)
     trend = read_trend(trend_candles, trend_ind)
-    signal = build_signal(
-        args.symbol, signal_tf, trend_tf, sig_candles, sig_ind, trend, sig_src,
-        sl_atr_mult=sl_atr_mult, tp_mults=tp_mults, lookback=lookback,
-    )
 
+    # Fade entries need the order-book walls, so fetch the heatmap up front.
     heatmap = None
-    if args.heatmap:
+    want_heatmap = args.heatmap or args.entry == "fade"
+    if want_heatmap:
         try:
             bids, asks, ob_src = fetch_orderbook(args.symbol)
             heatmap = build_heatmap(
@@ -831,6 +885,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
         except (urllib.error.URLError, RuntimeError, ValueError, KeyError) as exc:
             print(f"Warning: heatmap unavailable: {exc}", file=sys.stderr)
+
+    if args.entry == "fade" and heatmap is None:
+        print(
+            "Warning: fade entry needs order-book data; falling back to momentum.",
+            file=sys.stderr,
+        )
+
+    signal = build_signal(
+        args.symbol, signal_tf, trend_tf, sig_candles, sig_ind, trend, sig_src,
+        sl_atr_mult=sl_atr_mult, tp_mults=tp_mults, lookback=lookback,
+        entry_style=args.entry, heatmap=heatmap,
+    )
 
     if args.json:
         out = to_dict(signal)
