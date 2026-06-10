@@ -10,6 +10,7 @@ needs no API keys and only the Python standard library, so it can be run as a
 quick technical screen, e.g.::
 
     python scripts/crypto_signal.py WLD --signal-tf 15m --trend-tf 1h
+    python scripts/crypto_signal.py WLD --preset scalp   # 5m entry / 15m trend
 
 Data is pulled from public, key-less exchange endpoints (OKX, with Kraken as a
 fallback). This is a research/technical tool, not financial advice.
@@ -362,6 +363,9 @@ def build_signal(
     sig_ind: Indicators,
     trend: TrendRead,
     source: str,
+    sl_atr_mult: float = 1.5,
+    tp_mults: tuple[float, float] = (1.5, 3.0),
+    lookback: int = 20,
 ) -> Signal:
     i = len(sig_candles) - 1
     price = sig_candles[i].close
@@ -370,7 +374,7 @@ def build_signal(
     ef, es = sig_ind.ema_fast[i], sig_ind.ema_slow[i]
     mh = sig_ind.macd_hist[i]
     mh_prev = sig_ind.macd_hist[i - 1] if i > 0 else None
-    hi, lo = swing_levels(sig_candles, 20)
+    hi, lo = swing_levels(sig_candles, lookback)
 
     # ----- 1. Directional bias (always pick a side) ----------------------- #
     if trend.direction == "UP":
@@ -440,17 +444,17 @@ def build_signal(
             sig.trigger_price = price
         else:
             sig.entry = hi
-            sig.trigger = f"15m close ABOVE recent high {fmt(hi)}"
+            sig.trigger = f"{signal_tf} close ABOVE recent high {fmt(hi)}"
             sig.trigger_price = hi
         sig.invalidation = lo
-        sig.invalidation_note = f"15m close BELOW recent low {fmt(lo)} cancels the long"
+        sig.invalidation_note = f"{signal_tf} close BELOW recent low {fmt(lo)} cancels the long"
         struct_sl = lo - buf
-        atr_sl = sig.entry - 1.5 * a if a else struct_sl
+        atr_sl = sig.entry - sl_atr_mult * a if a else struct_sl
         sig.stop_loss = min(struct_sl, atr_sl) if a else struct_sl
         risk = sig.entry - sig.stop_loss
         if risk > 0:
-            sig.take_profit = [sig.entry + 1.5 * risk, sig.entry + 3.0 * risk]
-            sig.risk_reward = 1.5
+            sig.take_profit = [sig.entry + tp_mults[0] * risk, sig.entry + tp_mults[1] * risk]
+            sig.risk_reward = tp_mults[0]
     else:
         if status == "ACTIVE":
             sig.entry = price
@@ -458,17 +462,17 @@ def build_signal(
             sig.trigger_price = price
         else:
             sig.entry = lo
-            sig.trigger = f"15m close BELOW recent low {fmt(lo)}"
+            sig.trigger = f"{signal_tf} close BELOW recent low {fmt(lo)}"
             sig.trigger_price = lo
         sig.invalidation = hi
-        sig.invalidation_note = f"15m close ABOVE recent high {fmt(hi)} cancels the short"
+        sig.invalidation_note = f"{signal_tf} close ABOVE recent high {fmt(hi)} cancels the short"
         struct_sl = hi + buf
-        atr_sl = sig.entry + 1.5 * a if a else struct_sl
+        atr_sl = sig.entry + sl_atr_mult * a if a else struct_sl
         sig.stop_loss = max(struct_sl, atr_sl) if a else struct_sl
         risk = sig.stop_loss - sig.entry
         if risk > 0:
-            sig.take_profit = [sig.entry - 1.5 * risk, sig.entry - 3.0 * risk]
-            sig.risk_reward = 1.5
+            sig.take_profit = [sig.entry - tp_mults[0] * risk, sig.entry - tp_mults[1] * risk]
+            sig.risk_reward = tp_mults[0]
 
     strength = abs(trend.score) + len(reasons)
     sig.confidence = "high" if strength >= 6 else "medium" if strength >= 4 else "low"
@@ -561,21 +565,53 @@ def to_dict(sig: Signal) -> dict:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+PRESETS = {
+    # name -> tuned defaults for a trading style
+    "scalp": {
+        "signal_tf": "5m", "trend_tf": "15m", "ema_fast": 5, "ema_slow": 13,
+        "sl_atr_mult": 1.0, "tp_mults": (1.0, 2.0), "lookback": 10,
+    },
+    "intraday": {
+        "signal_tf": "15m", "trend_tf": "1h", "ema_fast": 9, "ema_slow": 21,
+        "sl_atr_mult": 1.5, "tp_mults": (1.5, 3.0), "lookback": 20,
+    },
+    "swing": {
+        "signal_tf": "1h", "trend_tf": "4h", "ema_fast": 21, "ema_slow": 55,
+        "sl_atr_mult": 2.0, "tp_mults": (2.0, 4.0), "lookback": 30,
+    },
+}
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Multi-timeframe crypto trading signal generator (key-less).",
     )
     parser.add_argument("symbol", help="Base symbol, e.g. WLD, BTC, ETH")
-    parser.add_argument("--signal-tf", default="15m", help="Entry timeframe (default 15m)")
-    parser.add_argument("--trend-tf", default="1h", help="Trend filter timeframe (default 1h)")
-    parser.add_argument("--ema-fast", type=int, default=9, help="Fast EMA period")
-    parser.add_argument("--ema-slow", type=int, default=21, help="Slow EMA period")
+    parser.add_argument(
+        "--preset",
+        choices=sorted(PRESETS),
+        default="intraday",
+        help="Trading style preset (default intraday). 'scalp' uses 5m/15m and tight stops.",
+    )
+    parser.add_argument("--signal-tf", default=None, help="Override entry timeframe")
+    parser.add_argument("--trend-tf", default=None, help="Override trend filter timeframe")
+    parser.add_argument("--ema-fast", type=int, default=None, help="Override fast EMA period")
+    parser.add_argument("--ema-slow", type=int, default=None, help="Override slow EMA period")
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     args = parser.parse_args(argv)
 
+    preset = PRESETS[args.preset]
+    signal_tf_raw = args.signal_tf or preset["signal_tf"]
+    trend_tf_raw = args.trend_tf or preset["trend_tf"]
+    ema_fast = args.ema_fast or preset["ema_fast"]
+    ema_slow = args.ema_slow or preset["ema_slow"]
+    sl_atr_mult = preset["sl_atr_mult"]
+    tp_mults = preset["tp_mults"]
+    lookback = preset["lookback"]
+
     try:
-        signal_tf = normalize_tf(args.signal_tf)
-        trend_tf = normalize_tf(args.trend_tf)
+        signal_tf = normalize_tf(signal_tf_raw)
+        trend_tf = normalize_tf(trend_tf_raw)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -587,11 +623,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    trend_ind = compute_indicators(trend_candles, args.ema_fast, args.ema_slow)
-    sig_ind = compute_indicators(sig_candles, args.ema_fast, args.ema_slow)
+    trend_ind = compute_indicators(trend_candles, ema_fast, ema_slow)
+    sig_ind = compute_indicators(sig_candles, ema_fast, ema_slow)
     trend = read_trend(trend_candles, trend_ind)
     signal = build_signal(
-        args.symbol, signal_tf, trend_tf, sig_candles, sig_ind, trend, sig_src
+        args.symbol, signal_tf, trend_tf, sig_candles, sig_ind, trend, sig_src,
+        sl_atr_mult=sl_atr_mult, tp_mults=tp_mults, lookback=lookback,
     )
 
     if args.json:
