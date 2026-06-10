@@ -14,6 +14,7 @@ quick technical screen, e.g.::
     python scripts/crypto_signal.py WLD --heatmap        # + order-book liquidity heatmap
     python scripts/crypto_signal.py WLD --entry fade     # limit entry at the wall, stop beyond it
     python scripts/crypto_signal.py WLD --entry market --sl-pct 0.5  # enter now, tight 0.5% stop
+    python scripts/crypto_signal.py WLD --entry pullback # resting LIMIT order at a better price
 
 Data is pulled from public, key-less exchange endpoints (OKX, with Kraken as a
 fallback). This is a research/technical tool, not financial advice.
@@ -499,6 +500,40 @@ def build_signal(
         sig.confidence = "high" if strength >= 6 else "medium" if strength >= 4 else "low"
         return sig
 
+    # Pullback: a resting LIMIT order at a better price (a retrace toward the
+    # fast EMA), so no market order is used. For shorts the limit sits above
+    # price; for longs, below. Stop distance honors --sl-pct / --sl-atr.
+    if entry_style == "pullback":
+        if side == "SHORT":
+            target = ef if (ef is not None and ef > price) else price + 0.5 * a
+        else:
+            target = ef if (ef is not None and ef < price) else price - 0.5 * a
+        sig.entry = target
+        sig.status = "PENDING"
+        sig.trigger = f"LIMIT {side} at ~{fmt(target)} (wait for pullback - no market order)"
+        sig.trigger_price = target
+        if sl_pct:
+            dist = target * sl_pct / 100.0
+        elif a:
+            dist = sl_atr_mult * a
+        else:
+            dist = target * 0.005
+        if side == "SHORT":
+            sig.stop_loss = target + dist
+            sig.take_profit = [target - tp_mults[0] * dist, target - tp_mults[1] * dist]
+        else:
+            sig.stop_loss = target - dist
+            sig.take_profit = [target + tp_mults[0] * dist, target + tp_mults[1] * dist]
+        sig.invalidation = sig.stop_loss
+        sig.invalidation_note = (
+            f"price hitting stop {fmt(sig.stop_loss)} cancels the {side.lower()}"
+        )
+        sig.risk_reward = tp_mults[0]
+        sig.bias_reason += " | limit pullback entry"
+        strength = abs(trend.score) + len(reasons)
+        sig.confidence = "high" if strength >= 6 else "medium" if strength >= 4 else "low"
+        return sig
+
     # Fade / mean-reversion: enter AT the opposing liquidity wall with the stop
     # placed BEYOND that wall, so a stop-hunt wick into the wall does not eject
     # the position. Requires a heatmap with the relevant wall.
@@ -864,12 +899,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--ema-slow", type=int, default=None, help="Override slow EMA period")
     parser.add_argument(
         "--entry",
-        choices=["momentum", "fade", "market"],
+        choices=["momentum", "fade", "market", "pullback"],
         default="momentum",
         help=(
             "Entry style: 'momentum' = breakout/breakdown beyond the swing "
             "(default); 'fade' = limit entry AT the order-book wall, stop beyond "
-            "it; 'market' = enter now at price with a tight, fixed-distance stop."
+            "it; 'market' = enter now at price; 'pullback' = resting LIMIT order "
+            "at a better price (retrace toward the fast EMA, no market order)."
         ),
     )
     parser.add_argument(
