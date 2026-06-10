@@ -322,12 +322,24 @@ def read_trend(candles: list[Candle], ind: Indicators) -> TrendRead:
     return TrendRead(direction=direction, score=score, reasons=reasons)
 
 
+def swing_levels(candles: list[Candle], lookback: int = 20) -> tuple[float, float]:
+    """Return (recent_high, recent_low) over the last `lookback` candles."""
+    window = candles[-lookback:] if len(candles) >= lookback else candles
+    return max(c.high for c in window), min(c.low for c in window)
+
+
 @dataclass
 class Signal:
     symbol: str
-    side: str  # LONG / SHORT / NO TRADE
+    side: str  # LONG / SHORT
+    status: str  # ACTIVE / PENDING
     price: float
+    bias_reason: str = ""
     entry: Optional[float] = None
+    trigger: str = ""
+    trigger_price: Optional[float] = None
+    invalidation: Optional[float] = None
+    invalidation_note: str = ""
     stop_loss: Optional[float] = None
     take_profit: list[float] = field(default_factory=list)
     risk_reward: Optional[float] = None
@@ -338,6 +350,8 @@ class Signal:
     trend_tf: str = ""
     source: str = ""
     atr: Optional[float] = None
+    recent_high: Optional[float] = None
+    recent_low: Optional[float] = None
 
 
 def build_signal(
@@ -351,78 +365,113 @@ def build_signal(
 ) -> Signal:
     i = len(sig_candles) - 1
     price = sig_candles[i].close
-    a = sig_ind.atr[i]
+    a = sig_ind.atr[i] or 0.0
     r = sig_ind.rsi[i]
     ef, es = sig_ind.ema_fast[i], sig_ind.ema_slow[i]
-    mh, mh_prev = sig_ind.macd_hist[i], sig_ind.macd_hist[i - 1] if i > 0 else None
+    mh = sig_ind.macd_hist[i]
+    mh_prev = sig_ind.macd_hist[i - 1] if i > 0 else None
+    hi, lo = swing_levels(sig_candles, 20)
 
-    sig = Signal(
-        symbol=symbol.upper(),
-        side="NO TRADE",
-        price=price,
-        trend=trend,
-        signal_tf=signal_tf,
-        trend_tf=trend_tf,
-        source=source,
-        atr=a,
-    )
-
-    reasons: list[str] = []
-    long_ok = short_ok = False
-
+    # ----- 1. Directional bias (always pick a side) ----------------------- #
     if trend.direction == "UP":
-        # only look for longs in line with the higher TF trend
+        side, bias_reason = "LONG", f"{trend_tf} trend is UP (score {trend.score:+d})"
+    elif trend.direction == "DOWN":
+        side, bias_reason = "SHORT", f"{trend_tf} trend is DOWN (score {trend.score:+d})"
+    else:  # SIDEWAYS -> lean on score sign, then price vs slow EMA
+        if trend.score > 0 or (trend.score == 0 and es is not None and price >= es):
+            side = "LONG"
+        else:
+            side = "SHORT"
+        bias_reason = f"{trend_tf} trend is SIDEWAYS; leaning {side} on net bias"
+
+    # ----- 2. Are momentum conditions already aligned now? ---------------- #
+    reasons: list[str] = []
+    if side == "LONG":
         cond_ema = ef is not None and es is not None and ef > es
         cond_macd = mh is not None and mh > 0
         cond_rsi = r is not None and 45 <= r <= 75
         if cond_ema:
-            reasons.append(f"{signal_tf} EMA fast > slow confirms uptrend")
+            reasons.append(f"{signal_tf} EMA fast > slow")
         if cond_macd:
-            reasons.append(f"{signal_tf} MACD histogram positive (momentum)")
+            reasons.append(f"{signal_tf} MACD histogram positive")
         if mh is not None and mh_prev is not None and mh > mh_prev:
             reasons.append(f"{signal_tf} MACD momentum rising")
-        if cond_rsi:
+        if cond_rsi and r is not None:
             reasons.append(f"{signal_tf} RSI {r:.1f} healthy (not overbought)")
-        long_ok = cond_ema and cond_macd and cond_rsi
-    elif trend.direction == "DOWN":
+        aligned = cond_ema and cond_macd and cond_rsi
+    else:
         cond_ema = ef is not None and es is not None and ef < es
         cond_macd = mh is not None and mh < 0
         cond_rsi = r is not None and 25 <= r <= 55
         if cond_ema:
-            reasons.append(f"{signal_tf} EMA fast < slow confirms downtrend")
+            reasons.append(f"{signal_tf} EMA fast < slow")
         if cond_macd:
-            reasons.append(f"{signal_tf} MACD histogram negative (momentum)")
+            reasons.append(f"{signal_tf} MACD histogram negative")
         if mh is not None and mh_prev is not None and mh < mh_prev:
             reasons.append(f"{signal_tf} MACD momentum falling")
-        if cond_rsi:
+        if cond_rsi and r is not None:
             reasons.append(f"{signal_tf} RSI {r:.1f} healthy (not oversold)")
-        short_ok = cond_ema and cond_macd and cond_rsi
+        aligned = cond_ema and cond_macd and cond_rsi
 
-    if long_ok or short_ok:
-        side = "LONG" if long_ok else "SHORT"
-        sig.side = side
-        sig.entry = price
-        sig.entry_reasons = reasons
-        if a:
-            if side == "LONG":
-                sig.stop_loss = price - 1.5 * a
-                risk = price - sig.stop_loss
-                sig.take_profit = [price + 1.5 * risk, price + 3.0 * risk]
-            else:
-                sig.stop_loss = price + 1.5 * a
-                risk = sig.stop_loss - price
-                sig.take_profit = [price - 1.5 * risk, price - 3.0 * risk]
-            sig.risk_reward = 1.5
-        strength = abs(trend.score) + len(reasons)
-        sig.confidence = "high" if strength >= 6 else "medium" if strength >= 4 else "low"
-    else:
-        if trend.direction == "SIDEWAYS":
-            sig.entry_reasons = ["Higher timeframe trend is sideways - stand aside"]
+    status = "ACTIVE" if aligned else "PENDING"
+
+    sig = Signal(
+        symbol=symbol.upper(),
+        side=side,
+        status=status,
+        price=price,
+        bias_reason=bias_reason,
+        trend=trend,
+        signal_tf=signal_tf,
+        trend_tf=trend_tf,
+        source=source,
+        atr=a or None,
+        recent_high=hi,
+        recent_low=lo,
+        entry_reasons=reasons or [f"{signal_tf} momentum not yet aligned with bias"],
+    )
+
+    # ----- 3. Trigger, invalidation, entry, stop, targets ----------------- #
+    buf = 0.3 * a  # small buffer beyond structure
+    if side == "LONG":
+        if status == "ACTIVE":
+            sig.entry = price
+            sig.trigger = f"Market / immediate at ~{fmt(price)} (momentum already aligned)"
+            sig.trigger_price = price
         else:
-            sig.entry_reasons = [
-                f"{trend_tf} trend is {trend.direction} but {signal_tf} entry "
-                "conditions not yet aligned"
-            ]
+            sig.entry = hi
+            sig.trigger = f"15m close ABOVE recent high {fmt(hi)}"
+            sig.trigger_price = hi
+        sig.invalidation = lo
+        sig.invalidation_note = f"15m close BELOW recent low {fmt(lo)} cancels the long"
+        struct_sl = lo - buf
+        atr_sl = sig.entry - 1.5 * a if a else struct_sl
+        sig.stop_loss = min(struct_sl, atr_sl) if a else struct_sl
+        risk = sig.entry - sig.stop_loss
+        if risk > 0:
+            sig.take_profit = [sig.entry + 1.5 * risk, sig.entry + 3.0 * risk]
+            sig.risk_reward = 1.5
+    else:
+        if status == "ACTIVE":
+            sig.entry = price
+            sig.trigger = f"Market / immediate at ~{fmt(price)} (momentum already aligned)"
+            sig.trigger_price = price
+        else:
+            sig.entry = lo
+            sig.trigger = f"15m close BELOW recent low {fmt(lo)}"
+            sig.trigger_price = lo
+        sig.invalidation = hi
+        sig.invalidation_note = f"15m close ABOVE recent high {fmt(hi)} cancels the short"
+        struct_sl = hi + buf
+        atr_sl = sig.entry + 1.5 * a if a else struct_sl
+        sig.stop_loss = max(struct_sl, atr_sl) if a else struct_sl
+        risk = sig.stop_loss - sig.entry
+        if risk > 0:
+            sig.take_profit = [sig.entry - 1.5 * risk, sig.entry - 3.0 * risk]
+            sig.risk_reward = 1.5
+
+    strength = abs(trend.score) + len(reasons)
+    sig.confidence = "high" if strength >= 6 else "medium" if strength >= 4 else "low"
     return sig
 
 
@@ -441,30 +490,38 @@ def render_text(sig: Signal) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     arrow = {"UP": "^", "DOWN": "v", "SIDEWAYS": "-"}[sig.trend.direction]
     lines = [
-        "=" * 56,
+        "=" * 60,
         f" SIGNAL  {sig.symbol}/USDT   ({sig.signal_tf} entry / {sig.trend_tf} trend)",
-        "=" * 56,
+        "=" * 60,
         f" Time        : {now}",
         f" Data source : {sig.source}",
         f" Last price  : {fmt(sig.price)}",
         f" {sig.trend_tf} trend    : {sig.trend.direction} [{arrow}] (score {sig.trend.score:+d})",
-        "-" * 56,
-        f" DECISION    : {sig.side}" + (f"  ({sig.confidence} confidence)" if sig.side != "NO TRADE" else ""),
+        "-" * 60,
+        f" DECISION    : {sig.side}  [{sig.status}]  ({sig.confidence} confidence)",
+        f" Bias        : {sig.bias_reason}",
+        "-" * 60,
+        f" TRIGGER     : {sig.trigger}",
+        f" Entry       : {fmt(sig.entry)}",
+        f" INVALIDATION: {sig.invalidation_note}",
+        f" Stop loss   : {fmt(sig.stop_loss)}",
     ]
-    if sig.side != "NO TRADE":
-        lines.append(f" Entry       : {fmt(sig.entry)}")
-        lines.append(f" Stop loss   : {fmt(sig.stop_loss)}")
-        if sig.take_profit:
-            lines.append(f" Take profit : TP1 {fmt(sig.take_profit[0])}  |  TP2 {fmt(sig.take_profit[1])}")
-        lines.append(f" ATR({sig.signal_tf}) : {fmt(sig.atr)}   R:R(TP1) ~ {sig.risk_reward}")
-    lines.append("-" * 56)
+    if sig.take_profit:
+        lines.append(f" Take profit : TP1 {fmt(sig.take_profit[0])}  |  TP2 {fmt(sig.take_profit[1])}")
+    lines.append(
+        f" ATR({sig.signal_tf}): {fmt(sig.atr)}   R:R(TP1) ~ {sig.risk_reward}   "
+        f"range[{fmt(sig.recent_low)} - {fmt(sig.recent_high)}]"
+    )
+    lines.append("-" * 60)
     lines.append(f" {sig.trend_tf} trend rationale:")
     for rsn in sig.trend.reasons:
         lines.append(f"   - {rsn}")
-    lines.append(f" {sig.signal_tf} entry rationale:")
+    lines.append(f" {sig.signal_tf} momentum:")
     for rsn in sig.entry_reasons:
         lines.append(f"   - {rsn}")
-    lines.append("=" * 56)
+    if sig.status == "PENDING":
+        lines.append(" NOTE: PENDING setup - wait for the TRIGGER before entering.")
+    lines.append("=" * 60)
     lines.append(" Research/technical screen only - not financial advice.")
     return "\n".join(lines)
 
@@ -482,14 +539,22 @@ def to_dict(sig: Signal) -> dict:
             "score": sig.trend.score,
             "reasons": sig.trend.reasons,
         },
-        "decision": sig.side,
+        "side": sig.side,
+        "status": sig.status,
         "confidence": sig.confidence,
+        "bias_reason": sig.bias_reason,
+        "trigger": sig.trigger,
+        "trigger_price": sig.trigger_price,
         "entry": sig.entry,
+        "invalidation": sig.invalidation,
+        "invalidation_note": sig.invalidation_note,
         "stop_loss": sig.stop_loss,
         "take_profit": sig.take_profit,
         "atr": sig.atr,
         "risk_reward_tp1": sig.risk_reward,
-        "entry_reasons": sig.entry_reasons,
+        "recent_high": sig.recent_high,
+        "recent_low": sig.recent_low,
+        "momentum_reasons": sig.entry_reasons,
     }
 
 
