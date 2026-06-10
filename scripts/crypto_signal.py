@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""Multi-timeframe crypto trading signal generator.
+
+A self-contained, dependency-free helper that produces an intraday trading
+signal for a crypto pair by aligning a fast signal timeframe (default 15m)
+with a higher-timeframe trend filter (default 1h).
+
+It is intentionally separate from the LLM-driven TradingAgents pipeline: it
+needs no API keys and only the Python standard library, so it can be run as a
+quick technical screen, e.g.::
+
+    python scripts/crypto_signal.py WLD --signal-tf 15m --trend-tf 1h
+
+Data is pulled from public, key-less exchange endpoints (OKX, with Kraken as a
+fallback). This is a research/technical tool, not financial advice.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+
+
+# --------------------------------------------------------------------------- #
+# Data structures
+# --------------------------------------------------------------------------- #
+@dataclass
+class Candle:
+    ts: int  # epoch seconds (open time)
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+@dataclass
+class Indicators:
+    ema_fast: list[Optional[float]] = field(default_factory=list)
+    ema_slow: list[Optional[float]] = field(default_factory=list)
+    rsi: list[Optional[float]] = field(default_factory=list)
+    macd: list[Optional[float]] = field(default_factory=list)
+    macd_signal: list[Optional[float]] = field(default_factory=list)
+    macd_hist: list[Optional[float]] = field(default_factory=list)
+    atr: list[Optional[float]] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Timeframe handling
+# --------------------------------------------------------------------------- #
+# Canonical timeframe -> (okx bar, kraken interval in minutes)
+_TF_MAP = {
+    "1m": ("1m", 1),
+    "3m": ("3m", 3),
+    "5m": ("5m", 5),
+    "15m": ("15m", 15),
+    "30m": ("30m", 30),
+    "1h": ("1H", 60),
+    "2h": ("2H", 120),
+    "4h": ("4H", 240),
+    "6h": ("6H", 360),
+    "12h": ("12H", 720),
+    "1d": ("1D", 1440),
+}
+
+
+def normalize_tf(tf: str) -> str:
+    key = tf.strip().lower().replace("min", "m").replace("hour", "h")
+    if key not in _TF_MAP:
+        raise ValueError(
+            f"Unsupported timeframe '{tf}'. Choose from: {', '.join(_TF_MAP)}"
+        )
+    return key
+
+
+# --------------------------------------------------------------------------- #
+# Data fetching (key-less public endpoints)
+# --------------------------------------------------------------------------- #
+def _http_get_json(url: str, timeout: int = 15) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": "tradingagents-signal/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _fetch_okx(symbol: str, tf: str, limit: int) -> list[Candle]:
+    bar = _TF_MAP[tf][0]
+    inst = f"{symbol.upper()}-USDT"
+    url = (
+        "https://www.okx.com/api/v5/market/candles"
+        f"?instId={inst}&bar={bar}&limit={min(limit, 300)}"
+    )
+    data = _http_get_json(url)
+    if str(data.get("code")) != "0" or not data.get("data"):
+        raise RuntimeError(f"OKX returned no data for {inst} ({bar}): {data.get('msg')}")
+    candles: list[Candle] = []
+    for row in data["data"]:
+        # row: [ts(ms), o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+        confirm = row[8] if len(row) > 8 else "1"
+        if confirm == "0":  # drop the still-forming candle
+            continue
+        candles.append(
+            Candle(
+                ts=int(int(row[0]) / 1000),
+                open=float(row[1]),
+                high=float(row[2]),
+                low=float(row[3]),
+                close=float(row[4]),
+                volume=float(row[5]),
+            )
+        )
+    candles.sort(key=lambda c: c.ts)  # oldest -> newest
+    return candles
+
+
+def _fetch_kraken(symbol: str, tf: str, limit: int) -> list[Candle]:
+    interval = _TF_MAP[tf][1]
+    pair = f"{symbol.upper()}USD"
+    url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={interval}"
+    data = _http_get_json(url)
+    if data.get("error"):
+        raise RuntimeError(f"Kraken error for {pair}: {data['error']}")
+    result = data.get("result", {})
+    series_key = next((k for k in result if k != "last"), None)
+    if not series_key:
+        raise RuntimeError(f"Kraken returned no series for {pair}")
+    candles: list[Candle] = []
+    for row in result[series_key]:
+        # row: [time, open, high, low, close, vwap, volume, count]
+        candles.append(
+            Candle(
+                ts=int(row[0]),
+                open=float(row[1]),
+                high=float(row[2]),
+                low=float(row[3]),
+                close=float(row[4]),
+                volume=float(row[6]),
+            )
+        )
+    candles.sort(key=lambda c: c.ts)
+    return candles[-limit:]
+
+
+def fetch_candles(symbol: str, tf: str, limit: int = 300) -> tuple[list[Candle], str]:
+    """Fetch candles, returning (candles, source). Tries OKX then Kraken."""
+    errors = []
+    for name, fn in (("OKX", _fetch_okx), ("Kraken", _fetch_kraken)):
+        try:
+            candles = fn(symbol, tf, limit)
+            if candles:
+                return candles, name
+        except (urllib.error.URLError, RuntimeError, ValueError, KeyError) as exc:
+            errors.append(f"{name}: {exc}")
+    raise RuntimeError(
+        f"Could not fetch {symbol} {tf} candles from any source. " + " | ".join(errors)
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Indicators (pure Python)
+# --------------------------------------------------------------------------- #
+def ema(values: list[float], period: int) -> list[Optional[float]]:
+    out: list[Optional[float]] = [None] * len(values)
+    if len(values) < period:
+        return out
+    k = 2.0 / (period + 1)
+    seed = sum(values[:period]) / period
+    out[period - 1] = seed
+    prev = seed
+    for i in range(period, len(values)):
+        prev = values[i] * k + prev * (1 - k)
+        out[i] = prev
+    return out
+
+
+def rsi(closes: list[float], period: int = 14) -> list[Optional[float]]:
+    out: list[Optional[float]] = [None] * len(closes)
+    if len(closes) <= period:
+        return out
+    gains = 0.0
+    losses = 0.0
+    for i in range(1, period + 1):
+        delta = closes[i] - closes[i - 1]
+        gains += max(delta, 0.0)
+        losses += max(-delta, 0.0)
+    avg_gain = gains / period
+    avg_loss = losses / period
+    out[period] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1 + avg_gain / avg_loss)
+    for i in range(period + 1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        gain = max(delta, 0.0)
+        loss = max(-delta, 0.0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        out[i] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1 + avg_gain / avg_loss)
+    return out
+
+
+def macd(
+    closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9
+) -> tuple[list[Optional[float]], list[Optional[float]], list[Optional[float]]]:
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    macd_line: list[Optional[float]] = [
+        (f - s) if (f is not None and s is not None) else None
+        for f, s in zip(ema_fast, ema_slow)
+    ]
+    # signal line is EMA of the defined macd values
+    defined = [(i, v) for i, v in enumerate(macd_line) if v is not None]
+    signal_line: list[Optional[float]] = [None] * len(closes)
+    hist: list[Optional[float]] = [None] * len(closes)
+    if len(defined) >= signal:
+        vals = [v for _, v in defined]
+        sig_vals = ema(vals, signal)
+        for (idx, _), s in zip(defined, sig_vals):
+            signal_line[idx] = s
+        for i in range(len(closes)):
+            if macd_line[i] is not None and signal_line[i] is not None:
+                hist[i] = macd_line[i] - signal_line[i]
+    return macd_line, signal_line, hist
+
+
+def atr(candles: list[Candle], period: int = 14) -> list[Optional[float]]:
+    out: list[Optional[float]] = [None] * len(candles)
+    if len(candles) <= period:
+        return out
+    trs: list[float] = []
+    for i in range(1, len(candles)):
+        c = candles[i]
+        prev_close = candles[i - 1].close
+        tr = max(
+            c.high - c.low,
+            abs(c.high - prev_close),
+            abs(c.low - prev_close),
+        )
+        trs.append(tr)
+    # trs is offset by 1 relative to candles
+    first = sum(trs[:period]) / period
+    out[period] = first
+    prev = first
+    for i in range(period + 1, len(candles)):
+        prev = (prev * (period - 1) + trs[i - 1]) / period
+        out[i] = prev
+    return out
+
+
+def compute_indicators(
+    candles: list[Candle], ema_fast: int, ema_slow: int
+) -> Indicators:
+    closes = [c.close for c in candles]
+    macd_line, macd_sig, macd_hist = macd(closes)
+    return Indicators(
+        ema_fast=ema(closes, ema_fast),
+        ema_slow=ema(closes, ema_slow),
+        rsi=rsi(closes, 14),
+        macd=macd_line,
+        macd_signal=macd_sig,
+        macd_hist=macd_hist,
+        atr=atr(candles, 14),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Signal logic
+# --------------------------------------------------------------------------- #
+@dataclass
+class TrendRead:
+    direction: str  # "UP", "DOWN", "SIDEWAYS"
+    score: int
+    reasons: list[str]
+
+
+def read_trend(candles: list[Candle], ind: Indicators) -> TrendRead:
+    i = len(candles) - 1
+    reasons: list[str] = []
+    score = 0
+    close = candles[i].close
+    ef, es = ind.ema_fast[i], ind.ema_slow[i]
+    if ef is not None and es is not None:
+        if ef > es:
+            score += 1
+            reasons.append(f"EMA fast {ef:.4f} > EMA slow {es:.4f} (bullish)")
+        else:
+            score -= 1
+            reasons.append(f"EMA fast {ef:.4f} < EMA slow {es:.4f} (bearish)")
+        if close > es:
+            score += 1
+            reasons.append("price above slow EMA")
+        else:
+            score -= 1
+            reasons.append("price below slow EMA")
+    mh = ind.macd_hist[i]
+    if mh is not None:
+        if mh > 0:
+            score += 1
+            reasons.append("MACD histogram positive")
+        else:
+            score -= 1
+            reasons.append("MACD histogram negative")
+    r = ind.rsi[i]
+    if r is not None:
+        if r >= 55:
+            score += 1
+            reasons.append(f"RSI {r:.1f} >= 55 (momentum up)")
+        elif r <= 45:
+            score -= 1
+            reasons.append(f"RSI {r:.1f} <= 45 (momentum down)")
+        else:
+            reasons.append(f"RSI {r:.1f} neutral")
+
+    if score >= 2:
+        direction = "UP"
+    elif score <= -2:
+        direction = "DOWN"
+    else:
+        direction = "SIDEWAYS"
+    return TrendRead(direction=direction, score=score, reasons=reasons)
+
+
+@dataclass
+class Signal:
+    symbol: str
+    side: str  # LONG / SHORT / NO TRADE
+    price: float
+    entry: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: list[float] = field(default_factory=list)
+    risk_reward: Optional[float] = None
+    confidence: str = "low"
+    trend: Optional[TrendRead] = None
+    entry_reasons: list[str] = field(default_factory=list)
+    signal_tf: str = ""
+    trend_tf: str = ""
+    source: str = ""
+    atr: Optional[float] = None
+
+
+def build_signal(
+    symbol: str,
+    signal_tf: str,
+    trend_tf: str,
+    sig_candles: list[Candle],
+    sig_ind: Indicators,
+    trend: TrendRead,
+    source: str,
+) -> Signal:
+    i = len(sig_candles) - 1
+    price = sig_candles[i].close
+    a = sig_ind.atr[i]
+    r = sig_ind.rsi[i]
+    ef, es = sig_ind.ema_fast[i], sig_ind.ema_slow[i]
+    mh, mh_prev = sig_ind.macd_hist[i], sig_ind.macd_hist[i - 1] if i > 0 else None
+
+    sig = Signal(
+        symbol=symbol.upper(),
+        side="NO TRADE",
+        price=price,
+        trend=trend,
+        signal_tf=signal_tf,
+        trend_tf=trend_tf,
+        source=source,
+        atr=a,
+    )
+
+    reasons: list[str] = []
+    long_ok = short_ok = False
+
+    if trend.direction == "UP":
+        # only look for longs in line with the higher TF trend
+        cond_ema = ef is not None and es is not None and ef > es
+        cond_macd = mh is not None and mh > 0
+        cond_rsi = r is not None and 45 <= r <= 75
+        if cond_ema:
+            reasons.append(f"{signal_tf} EMA fast > slow confirms uptrend")
+        if cond_macd:
+            reasons.append(f"{signal_tf} MACD histogram positive (momentum)")
+        if mh is not None and mh_prev is not None and mh > mh_prev:
+            reasons.append(f"{signal_tf} MACD momentum rising")
+        if cond_rsi:
+            reasons.append(f"{signal_tf} RSI {r:.1f} healthy (not overbought)")
+        long_ok = cond_ema and cond_macd and cond_rsi
+    elif trend.direction == "DOWN":
+        cond_ema = ef is not None and es is not None and ef < es
+        cond_macd = mh is not None and mh < 0
+        cond_rsi = r is not None and 25 <= r <= 55
+        if cond_ema:
+            reasons.append(f"{signal_tf} EMA fast < slow confirms downtrend")
+        if cond_macd:
+            reasons.append(f"{signal_tf} MACD histogram negative (momentum)")
+        if mh is not None and mh_prev is not None and mh < mh_prev:
+            reasons.append(f"{signal_tf} MACD momentum falling")
+        if cond_rsi:
+            reasons.append(f"{signal_tf} RSI {r:.1f} healthy (not oversold)")
+        short_ok = cond_ema and cond_macd and cond_rsi
+
+    if long_ok or short_ok:
+        side = "LONG" if long_ok else "SHORT"
+        sig.side = side
+        sig.entry = price
+        sig.entry_reasons = reasons
+        if a:
+            if side == "LONG":
+                sig.stop_loss = price - 1.5 * a
+                risk = price - sig.stop_loss
+                sig.take_profit = [price + 1.5 * risk, price + 3.0 * risk]
+            else:
+                sig.stop_loss = price + 1.5 * a
+                risk = sig.stop_loss - price
+                sig.take_profit = [price - 1.5 * risk, price - 3.0 * risk]
+            sig.risk_reward = 1.5
+        strength = abs(trend.score) + len(reasons)
+        sig.confidence = "high" if strength >= 6 else "medium" if strength >= 4 else "low"
+    else:
+        if trend.direction == "SIDEWAYS":
+            sig.entry_reasons = ["Higher timeframe trend is sideways - stand aside"]
+        else:
+            sig.entry_reasons = [
+                f"{trend_tf} trend is {trend.direction} but {signal_tf} entry "
+                "conditions not yet aligned"
+            ]
+    return sig
+
+
+# --------------------------------------------------------------------------- #
+# Output
+# --------------------------------------------------------------------------- #
+def fmt(x: Optional[float]) -> str:
+    if x is None:
+        return "n/a"
+    if abs(x) >= 100:
+        return f"{x:,.2f}"
+    return f"{x:.4f}"
+
+
+def render_text(sig: Signal) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    arrow = {"UP": "^", "DOWN": "v", "SIDEWAYS": "-"}[sig.trend.direction]
+    lines = [
+        "=" * 56,
+        f" SIGNAL  {sig.symbol}/USDT   ({sig.signal_tf} entry / {sig.trend_tf} trend)",
+        "=" * 56,
+        f" Time        : {now}",
+        f" Data source : {sig.source}",
+        f" Last price  : {fmt(sig.price)}",
+        f" {sig.trend_tf} trend    : {sig.trend.direction} [{arrow}] (score {sig.trend.score:+d})",
+        "-" * 56,
+        f" DECISION    : {sig.side}" + (f"  ({sig.confidence} confidence)" if sig.side != "NO TRADE" else ""),
+    ]
+    if sig.side != "NO TRADE":
+        lines.append(f" Entry       : {fmt(sig.entry)}")
+        lines.append(f" Stop loss   : {fmt(sig.stop_loss)}")
+        if sig.take_profit:
+            lines.append(f" Take profit : TP1 {fmt(sig.take_profit[0])}  |  TP2 {fmt(sig.take_profit[1])}")
+        lines.append(f" ATR({sig.signal_tf}) : {fmt(sig.atr)}   R:R(TP1) ~ {sig.risk_reward}")
+    lines.append("-" * 56)
+    lines.append(f" {sig.trend_tf} trend rationale:")
+    for rsn in sig.trend.reasons:
+        lines.append(f"   - {rsn}")
+    lines.append(f" {sig.signal_tf} entry rationale:")
+    for rsn in sig.entry_reasons:
+        lines.append(f"   - {rsn}")
+    lines.append("=" * 56)
+    lines.append(" Research/technical screen only - not financial advice.")
+    return "\n".join(lines)
+
+
+def to_dict(sig: Signal) -> dict:
+    return {
+        "symbol": sig.symbol,
+        "signal_timeframe": sig.signal_tf,
+        "trend_timeframe": sig.trend_tf,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": sig.source,
+        "price": sig.price,
+        "trend": {
+            "direction": sig.trend.direction,
+            "score": sig.trend.score,
+            "reasons": sig.trend.reasons,
+        },
+        "decision": sig.side,
+        "confidence": sig.confidence,
+        "entry": sig.entry,
+        "stop_loss": sig.stop_loss,
+        "take_profit": sig.take_profit,
+        "atr": sig.atr,
+        "risk_reward_tp1": sig.risk_reward,
+        "entry_reasons": sig.entry_reasons,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Multi-timeframe crypto trading signal generator (key-less).",
+    )
+    parser.add_argument("symbol", help="Base symbol, e.g. WLD, BTC, ETH")
+    parser.add_argument("--signal-tf", default="15m", help="Entry timeframe (default 15m)")
+    parser.add_argument("--trend-tf", default="1h", help="Trend filter timeframe (default 1h)")
+    parser.add_argument("--ema-fast", type=int, default=9, help="Fast EMA period")
+    parser.add_argument("--ema-slow", type=int, default=21, help="Slow EMA period")
+    parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    args = parser.parse_args(argv)
+
+    try:
+        signal_tf = normalize_tf(args.signal_tf)
+        trend_tf = normalize_tf(args.trend_tf)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        trend_candles, trend_src = fetch_candles(args.symbol, trend_tf)
+        sig_candles, sig_src = fetch_candles(args.symbol, signal_tf)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    trend_ind = compute_indicators(trend_candles, args.ema_fast, args.ema_slow)
+    sig_ind = compute_indicators(sig_candles, args.ema_fast, args.ema_slow)
+    trend = read_trend(trend_candles, trend_ind)
+    signal = build_signal(
+        args.symbol, signal_tf, trend_tf, sig_candles, sig_ind, trend, sig_src
+    )
+
+    if args.json:
+        print(json.dumps(to_dict(signal), indent=2))
+    else:
+        print(render_text(signal))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
