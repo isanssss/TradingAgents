@@ -13,6 +13,7 @@ quick technical screen, e.g.::
     python scripts/crypto_signal.py WLD --preset scalp   # 5m entry / 15m trend
     python scripts/crypto_signal.py WLD --heatmap        # + order-book liquidity heatmap
     python scripts/crypto_signal.py WLD --entry fade     # limit entry at the wall, stop beyond it
+    python scripts/crypto_signal.py WLD --entry market --sl-pct 0.5  # enter now, tight 0.5% stop
 
 Data is pulled from public, key-less exchange endpoints (OKX, with Kraken as a
 fallback). This is a research/technical tool, not financial advice.
@@ -392,6 +393,7 @@ def build_signal(
     lookback: int = 20,
     entry_style: str = "momentum",
     heatmap: Optional[Heatmap] = None,
+    sl_pct: Optional[float] = None,
 ) -> Signal:
     i = len(sig_candles) - 1
     price = sig_candles[i].close
@@ -464,6 +466,39 @@ def build_signal(
     # ----- 3. Trigger, invalidation, entry, stop, targets ----------------- #
     buf = 0.3 * a  # small buffer beyond structure
 
+    # Market: enter NOW at the current price with a tight, fixed-distance stop.
+    # Distance is a fixed % (--sl-pct) or an ATR multiple (--sl-atr); targets
+    # scale off the same distance so a tight stop also gives close targets.
+    if entry_style == "market":
+        if sl_pct:
+            dist = price * sl_pct / 100.0
+            stop_desc = f"{sl_pct:g}% stop"
+        elif a:
+            dist = sl_atr_mult * a
+            stop_desc = f"{sl_atr_mult:g}x ATR stop"
+        else:
+            dist = price * 0.005
+            stop_desc = "0.5% stop"
+        sig.entry = price
+        sig.status = "ACTIVE"
+        sig.trigger = f"Market now at ~{fmt(price)} ({stop_desc})"
+        sig.trigger_price = price
+        if side == "LONG":
+            sig.stop_loss = price - dist
+            sig.take_profit = [price + tp_mults[0] * dist, price + tp_mults[1] * dist]
+        else:
+            sig.stop_loss = price + dist
+            sig.take_profit = [price - tp_mults[0] * dist, price - tp_mults[1] * dist]
+        sig.invalidation = sig.stop_loss
+        sig.invalidation_note = (
+            f"price hitting stop {fmt(sig.stop_loss)} cancels the {side.lower()}"
+        )
+        sig.risk_reward = tp_mults[0]
+        sig.bias_reason += " | market entry, tight stop"
+        strength = abs(trend.score) + len(reasons)
+        sig.confidence = "high" if strength >= 6 else "medium" if strength >= 4 else "low"
+        return sig
+
     # Fade / mean-reversion: enter AT the opposing liquidity wall with the stop
     # placed BEYOND that wall, so a stop-hunt wick into the wall does not eject
     # the position. Requires a heatmap with the relevant wall.
@@ -517,9 +552,12 @@ def build_signal(
             sig.trigger_price = hi
         sig.invalidation = lo
         sig.invalidation_note = f"{signal_tf} close BELOW recent low {fmt(lo)} cancels the long"
-        struct_sl = lo - buf
-        atr_sl = sig.entry - sl_atr_mult * a if a else struct_sl
-        sig.stop_loss = min(struct_sl, atr_sl) if a else struct_sl
+        if sl_pct:
+            sig.stop_loss = sig.entry - sig.entry * sl_pct / 100.0
+        else:
+            struct_sl = lo - buf
+            atr_sl = sig.entry - sl_atr_mult * a if a else struct_sl
+            sig.stop_loss = min(struct_sl, atr_sl) if a else struct_sl
         risk = sig.entry - sig.stop_loss
         if risk > 0:
             sig.take_profit = [sig.entry + tp_mults[0] * risk, sig.entry + tp_mults[1] * risk]
@@ -535,9 +573,12 @@ def build_signal(
             sig.trigger_price = lo
         sig.invalidation = hi
         sig.invalidation_note = f"{signal_tf} close ABOVE recent high {fmt(hi)} cancels the short"
-        struct_sl = hi + buf
-        atr_sl = sig.entry + sl_atr_mult * a if a else struct_sl
-        sig.stop_loss = max(struct_sl, atr_sl) if a else struct_sl
+        if sl_pct:
+            sig.stop_loss = sig.entry + sig.entry * sl_pct / 100.0
+        else:
+            struct_sl = hi + buf
+            atr_sl = sig.entry + sl_atr_mult * a if a else struct_sl
+            sig.stop_loss = max(struct_sl, atr_sl) if a else struct_sl
         risk = sig.stop_loss - sig.entry
         if risk > 0:
             sig.take_profit = [sig.entry - tp_mults[0] * risk, sig.entry - tp_mults[1] * risk]
@@ -823,13 +864,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--ema-slow", type=int, default=None, help="Override slow EMA period")
     parser.add_argument(
         "--entry",
-        choices=["momentum", "fade"],
+        choices=["momentum", "fade", "market"],
         default="momentum",
         help=(
             "Entry style: 'momentum' = breakout/breakdown beyond the swing "
-            "(default); 'fade' = limit entry AT the order-book wall with the "
-            "stop placed BEYOND it (needs heatmap, auto-enabled)."
+            "(default); 'fade' = limit entry AT the order-book wall, stop beyond "
+            "it; 'market' = enter now at price with a tight, fixed-distance stop."
         ),
+    )
+    parser.add_argument(
+        "--sl-pct", type=float, default=None,
+        help="Stop-loss distance as a percent of entry (e.g. 0.5). Tightens entry/SL.",
+    )
+    parser.add_argument(
+        "--sl-atr", type=float, default=None,
+        help="Stop-loss distance as an ATR multiple (overrides the preset).",
     )
     parser.add_argument(
         "--heatmap",
@@ -851,7 +900,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     trend_tf_raw = args.trend_tf or preset["trend_tf"]
     ema_fast = args.ema_fast or preset["ema_fast"]
     ema_slow = args.ema_slow or preset["ema_slow"]
-    sl_atr_mult = preset["sl_atr_mult"]
+    sl_atr_mult = args.sl_atr if args.sl_atr is not None else preset["sl_atr_mult"]
     tp_mults = preset["tp_mults"]
     lookback = preset["lookback"]
 
@@ -895,7 +944,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal = build_signal(
         args.symbol, signal_tf, trend_tf, sig_candles, sig_ind, trend, sig_src,
         sl_atr_mult=sl_atr_mult, tp_mults=tp_mults, lookback=lookback,
-        entry_style=args.entry, heatmap=heatmap,
+        entry_style=args.entry, heatmap=heatmap, sl_pct=args.sl_pct,
     )
 
     if args.json:
