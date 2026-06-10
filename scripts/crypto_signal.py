@@ -11,6 +11,7 @@ quick technical screen, e.g.::
 
     python scripts/crypto_signal.py WLD --signal-tf 15m --trend-tf 1h
     python scripts/crypto_signal.py WLD --preset scalp   # 5m entry / 15m trend
+    python scripts/crypto_signal.py WLD --heatmap        # + order-book liquidity heatmap
 
 Data is pulled from public, key-less exchange endpoints (OKX, with Kraken as a
 fallback). This is a research/technical tool, not financial advice.
@@ -145,6 +146,28 @@ def _fetch_kraken(symbol: str, tf: str, limit: int) -> list[Candle]:
         )
     candles.sort(key=lambda c: c.ts)
     return candles[-limit:]
+
+
+def _fetch_orderbook_okx(symbol: str, depth: int = 5000) -> tuple[list, list]:
+    inst = f"{symbol.upper()}-USDT"
+    url = f"https://www.okx.com/api/v5/market/books-full?instId={inst}&sz={depth}"
+    data = _http_get_json(url)
+    if str(data.get("code")) != "0" or not data.get("data"):
+        # fall back to the shallower endpoint (max 400 levels)
+        url = f"https://www.okx.com/api/v5/market/books?instId={inst}&sz=400"
+        data = _http_get_json(url)
+        if str(data.get("code")) != "0" or not data.get("data"):
+            raise RuntimeError(f"OKX order book unavailable for {inst}: {data.get('msg')}")
+    book = data["data"][0]
+    bids = [(float(p), float(q)) for p, q, *_ in book["bids"]]
+    asks = [(float(p), float(q)) for p, q, *_ in book["asks"]]
+    return bids, asks
+
+
+def fetch_orderbook(symbol: str) -> tuple[list, list, str]:
+    """Return (bids, asks, source); each side is a list of (price, base_qty)."""
+    bids, asks = _fetch_orderbook_okx(symbol)
+    return bids, asks, "OKX"
 
 
 def fetch_candles(symbol: str, tf: str, limit: int = 300) -> tuple[list[Candle], str]:
@@ -480,6 +503,161 @@ def build_signal(
 
 
 # --------------------------------------------------------------------------- #
+# Order-book liquidity heatmap
+# --------------------------------------------------------------------------- #
+@dataclass
+class HeatBucket:
+    low: float
+    high: float
+    bid: float  # bid notional (quote)
+    ask: float  # ask notional (quote)
+
+    @property
+    def total(self) -> float:
+        return self.bid + self.ask
+
+    @property
+    def mid(self) -> float:
+        return (self.low + self.high) / 2
+
+
+@dataclass
+class Heatmap:
+    symbol: str
+    source: str
+    mid: float
+    range_pct: float
+    buckets: list[HeatBucket]
+    bid_notional: float
+    ask_notional: float
+    support: Optional[HeatBucket]  # biggest bid wall below price
+    resistance: Optional[HeatBucket]  # biggest ask wall above price
+
+    @property
+    def imbalance(self) -> float:
+        total = self.bid_notional + self.ask_notional
+        return 0.0 if total == 0 else (self.bid_notional - self.ask_notional) / total
+
+
+def build_heatmap(
+    symbol: str,
+    bids: list,
+    asks: list,
+    source: str,
+    range_pct: float = 0.03,
+    bins: int = 24,
+) -> Heatmap:
+    best_bid = bids[0][0] if bids else 0.0
+    best_ask = asks[0][0] if asks else 0.0
+    mid = (best_bid + best_ask) / 2 if best_bid and best_ask else (best_bid or best_ask)
+    lo, hi = mid * (1 - range_pct), mid * (1 + range_pct)
+    width = (hi - lo) / bins
+    bid_n = [0.0] * bins
+    ask_n = [0.0] * bins
+
+    def idx_of(p: float) -> Optional[int]:
+        if p < lo or p >= hi:
+            return None
+        return min(int((p - lo) / width), bins - 1)
+
+    for price, qty in bids:
+        j = idx_of(price)
+        if j is not None:
+            bid_n[j] += price * qty
+    for price, qty in asks:
+        j = idx_of(price)
+        if j is not None:
+            ask_n[j] += price * qty
+
+    buckets = [
+        HeatBucket(low=lo + k * width, high=lo + (k + 1) * width, bid=bid_n[k], ask=ask_n[k])
+        for k in range(bins)
+    ]
+    support = max(
+        (b for b in buckets if b.high <= mid and b.bid > 0), key=lambda b: b.bid, default=None
+    )
+    resistance = max(
+        (b for b in buckets if b.low >= mid and b.ask > 0), key=lambda b: b.ask, default=None
+    )
+    return Heatmap(
+        symbol=symbol.upper(),
+        source=source,
+        mid=mid,
+        range_pct=range_pct,
+        buckets=buckets,
+        bid_notional=sum(bid_n),
+        ask_notional=sum(ask_n),
+        support=support,
+        resistance=resistance,
+    )
+
+
+def _short_notional(x: float) -> str:
+    if x >= 1_000_000:
+        return f"{x / 1_000_000:.1f}M"
+    if x >= 1_000:
+        return f"{x / 1_000:.0f}k"
+    return f"{x:.0f}"
+
+
+def render_heatmap(hm: Heatmap) -> str:
+    peak = max((b.total for b in hm.buckets), default=0.0) or 1.0
+    width_chars = 30
+    lines = [
+        "=" * 60,
+        f" LIQUIDITY HEATMAP  {hm.symbol}/USDT  (order book, {hm.source})",
+        f" mid {fmt(hm.mid)}  |  +/-{hm.range_pct * 100:.1f}%  |  bar = bid/ask notional",
+        "=" * 60,
+    ]
+    for b in reversed(hm.buckets):  # high price at top
+        side = "A" if b.ask >= b.bid else "B"  # ask wall (resistance) vs bid wall (support)
+        fill = int(round(b.total / peak * width_chars))
+        bar = ("#" if side == "A" else "=") * fill
+        mark = ""
+        if hm.resistance and b is hm.resistance:
+            mark = " <== resistance wall"
+        elif hm.support and b is hm.support:
+            mark = " <== support wall"
+        lines.append(
+            f" {fmt(b.mid):>10} {side} |{bar:<{width_chars}} {_short_notional(b.total):>6}{mark}"
+        )
+    imb = hm.imbalance
+    lean = "BID-heavy (support/bullish)" if imb > 0.08 else (
+        "ASK-heavy (resistance/bearish)" if imb < -0.08 else "balanced"
+    )
+    lines.append("-" * 60)
+    lines.append(
+        f" Bid liq: {_short_notional(hm.bid_notional)}   "
+        f"Ask liq: {_short_notional(hm.ask_notional)}   "
+        f"imbalance {imb:+.0%} -> {lean}"
+    )
+    if hm.support:
+        lines.append(f" Nearest support wall : ~{fmt(hm.support.mid)} ({_short_notional(hm.support.bid)})")
+    if hm.resistance:
+        lines.append(f" Nearest resistance   : ~{fmt(hm.resistance.mid)} ({_short_notional(hm.resistance.ask)})")
+    lines.append("=" * 60)
+    lines.append(" Order-book snapshot - resting liquidity can be pulled/spoofed.")
+    return "\n".join(lines)
+
+
+def heatmap_to_dict(hm: Heatmap) -> dict:
+    return {
+        "symbol": hm.symbol,
+        "source": hm.source,
+        "mid": hm.mid,
+        "range_pct": hm.range_pct,
+        "bid_notional": hm.bid_notional,
+        "ask_notional": hm.ask_notional,
+        "imbalance": hm.imbalance,
+        "support_wall": None if not hm.support else {"price": hm.support.mid, "notional": hm.support.bid},
+        "resistance_wall": None if not hm.resistance else {"price": hm.resistance.mid, "notional": hm.resistance.ask},
+        "buckets": [
+            {"low": b.low, "high": b.high, "bid": b.bid, "ask": b.ask} for b in hm.buckets
+        ],
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Output
 # --------------------------------------------------------------------------- #
 def fmt(x: Optional[float]) -> str:
@@ -597,6 +775,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--trend-tf", default=None, help="Override trend filter timeframe")
     parser.add_argument("--ema-fast", type=int, default=None, help="Override fast EMA period")
     parser.add_argument("--ema-slow", type=int, default=None, help="Override slow EMA period")
+    parser.add_argument(
+        "--heatmap",
+        action="store_true",
+        help="Add an order-book liquidity heatmap (support/resistance walls)",
+    )
+    parser.add_argument(
+        "--hm-range", type=float, default=3.0,
+        help="Heatmap price range each side in percent (default 3.0)",
+    )
+    parser.add_argument(
+        "--hm-bins", type=int, default=24, help="Heatmap price buckets (default 24)",
+    )
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     args = parser.parse_args(argv)
 
@@ -631,10 +821,27 @@ def main(argv: Optional[list[str]] = None) -> int:
         sl_atr_mult=sl_atr_mult, tp_mults=tp_mults, lookback=lookback,
     )
 
+    heatmap = None
+    if args.heatmap:
+        try:
+            bids, asks, ob_src = fetch_orderbook(args.symbol)
+            heatmap = build_heatmap(
+                args.symbol, bids, asks, ob_src,
+                range_pct=args.hm_range / 100.0, bins=args.hm_bins,
+            )
+        except (urllib.error.URLError, RuntimeError, ValueError, KeyError) as exc:
+            print(f"Warning: heatmap unavailable: {exc}", file=sys.stderr)
+
     if args.json:
-        print(json.dumps(to_dict(signal), indent=2))
+        out = to_dict(signal)
+        if heatmap is not None:
+            out["heatmap"] = heatmap_to_dict(heatmap)
+        print(json.dumps(out, indent=2))
     else:
         print(render_text(signal))
+        if heatmap is not None:
+            print()
+            print(render_heatmap(heatmap))
     return 0
 
 
