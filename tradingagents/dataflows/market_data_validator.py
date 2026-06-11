@@ -15,7 +15,12 @@ from typing import Iterable, Optional
 import pandas as pd
 from stockstats import wrap
 
-from tradingagents.dataflows.stockstats_utils import load_ohlcv
+# Dispatches to whichever vendor is serving price action for the run (Yahoo
+# Finance, 01 Exchange, ...). Bound to ``load_ohlcv`` so the snapshot reads the
+# same source as get_stock_data/get_indicators.
+from tradingagents.dataflows.interface import (
+    load_ohlcv_for_active_vendor as load_ohlcv,
+)
 
 # A fixed, common indicator set so the snapshot is the same shape every run.
 DEFAULT_SNAPSHOT_INDICATORS: tuple[str, ...] = (

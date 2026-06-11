@@ -98,15 +98,21 @@ DEFAULT_CONFIG = _apply_env_overrides({
     ],
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
+    # zo_01 is the 01 Exchange (01.xyz) price-action feed; it only serves
+    # OHLCV/indicators for its listed crypto perps (e.g. WLD), so use it for
+    # core_stock_apis / technical_indicators and leave fundamentals/news on a
+    # general vendor.
     "data_vendors": {
-        "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance
-        "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
+        "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance, zo_01
+        "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance, zo_01
         "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance
         "news_data": "yfinance",             # Options: alpha_vantage, yfinance
     },
     # Tool-level configuration (takes precedence over category-level)
     "tool_vendors": {
         # Example: "get_stock_data": "alpha_vantage",  # Override category default
+        # Example: route WLD price action through 01 Exchange (01.xyz):
+        #   "get_stock_data": "zo_01", "get_indicators": "zo_01"
     },
     # Benchmark for alpha calculation in the reflection layer.
     # ``benchmark_ticker`` (when set) overrides the suffix map for all
