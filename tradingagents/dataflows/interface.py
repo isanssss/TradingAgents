@@ -22,6 +22,12 @@ from .alpha_vantage import (
     get_news as get_alpha_vantage_news,
     get_global_news as get_alpha_vantage_global_news,
 )
+from .zo_01 import (
+    get_stock as get_zo_stock,
+    get_indicator as get_zo_indicator,
+    load_zo_ohlcv,
+)
+from .stockstats_utils import load_ohlcv as load_yfinance_ohlcv
 from .alpha_vantage_common import AlphaVantageRateLimitError
 from .symbol_utils import NoMarketDataError
 
@@ -64,6 +70,7 @@ TOOLS_CATEGORIES = {
 VENDOR_LIST = [
     "yfinance",
     "alpha_vantage",
+    "zo_01",
 ]
 
 # Mapping of methods to their vendor-specific implementations
@@ -72,11 +79,13 @@ VENDOR_METHODS = {
     "get_stock_data": {
         "alpha_vantage": get_alpha_vantage_stock,
         "yfinance": get_YFin_data_online,
+        "zo_01": get_zo_stock,
     },
     # technical_indicators
     "get_indicators": {
         "alpha_vantage": get_alpha_vantage_indicator,
         "yfinance": get_stock_stats_indicators_window,
+        "zo_01": get_zo_indicator,
     },
     # fundamental_data
     "get_fundamentals": {
@@ -131,6 +140,27 @@ def get_vendor(category: str, method: str = None) -> str:
 
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
+
+
+# OHLCV loaders keyed by vendor, for callers (e.g. the verified market-data
+# snapshot) that need a price DataFrame directly rather than a formatted string.
+OHLCV_LOADERS = {
+    "yfinance": load_yfinance_ohlcv,
+    "zo_01": load_zo_ohlcv,
+}
+
+
+def load_ohlcv_for_active_vendor(symbol: str, curr_date: str):
+    """Load an OHLCV DataFrame using the configured ``core_stock_apis`` vendor.
+
+    Keeps the verified market-data snapshot consistent with whichever vendor is
+    serving price action for the run (e.g. 01 Exchange for ``WLD``). Vendors
+    without a direct loader (such as Alpha Vantage) fall back to Yahoo Finance.
+    """
+    vendor_config = get_vendor("core_stock_apis", "get_stock_data")
+    primary = vendor_config.split(",")[0].strip()
+    loader = OHLCV_LOADERS.get(primary, load_yfinance_ohlcv)
+    return loader(symbol, curr_date)
 
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
